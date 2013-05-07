@@ -1,4 +1,4 @@
-#!/usr/bin/perl -wT
+#!/usr/bin/perl -w
 #
 # ============================== SUMMARY =====================================
 #
@@ -247,6 +247,7 @@ my $version = "2.2";
 use strict;
 use Getopt::Long;
 use Time::HiRes qw(time);
+use Data::Dumper;
 
 our $no_snmp=0;
 eval 'use Net::SNMP';
@@ -352,6 +353,11 @@ my $phydrv_count_oid = undef;                # used only by sasraid to verify nu
 my $phydrv_goodcount_oid = undef;            # only sasraid. number of good drives in the system. not a table
 my $phydrv_badcount_oid = undef;             # only sasraid. number of bad drives in the system. not a table
 my $phydrv_bad2count_oid = undef;            # only sasraid. number of bad drives in the system. not a table
+my $adapter_status_tableoid = undef;		 # only sasraid. get adapter status overall, these includes goodcount,badcount, etc.. to optimize snmp requests.
+my $phydrv_controller_tableoid = undef;		 # only sasraid. get controller id for each drive
+my $phydrv_channel_tableoid = undef;         # only sasraid. get channel id (enclosure) for each drive
+my $phydrv_devid_tableoid = undef;	         # only sasraid. get device id for each drive
+my $phydrv_lunid_tableoid = undef;           # only sasraid. get lun id for each drive 
 my $sys_temperature_oid = undef;             # TODO: controller/system temperature
 my $readfail_oid = undef;                    # number of read fails. only old megaraid. not a table
 my $writefail_oid = undef;                   # number of write fails. only old megaraid. not a table
@@ -435,11 +441,16 @@ sub set_oids {
     $baseoid = "1.3.6.1.4.1.3582" if $baseoid eq "";               # megaraid standard base oid
     $logdrv_status_tableoid = $baseoid . ".4.1.4.3.1.2.1.5";       # sasraid logical
     # $sas_logdrv_name_tableoid = $baseoid . ".4.1.4.3.1.2.1.6";   # sas virtual device name
+    $adapter_status_tableoid = $baseoid . ".4.1.4.1.2.1";
     $phydrv_status_tableoid = $baseoid . ".4.1.4.2.1.2.1.10";      # sasraid physical
     $phydrv_mediumerrors_tableoid = $baseoid . ".4.1.4.2.1.2.1.7"; # sasraid medium errors
     $phydrv_othererrors_tableoid = $baseoid . ".4.1.4.2.1.2.1.8";  # sasraid other errors
     $phydrv_vendor_tableoid = $baseoid . ".4.1.4.2.1.2.1.24";      # sasraid drive vendor
     $phydrv_product_tableoid = $baseoid . ".4.1.4.2.1.2.1.25";     # sasraid drive model
+    $phydrv_controller_tableoid = $baseoid . ".4.1.4.2.1.2.1.22";  # sasraid drive to controller id
+    $phydrv_channel_tableoid = $baseoid . ".4.1.4.2.1.2.1.18";     # sasraid drive to enclosure/channel id
+    $phydrv_devid_tableoid = $baseoid . ".4.1.4.2.1.2.1.2";        # sasraid drive to device id
+    $phydrv_lunid_tableoid = $baseoid . ".4.1.5.4.1.1";            # sasraid drive to lun id
     $phydrv_count_oid = $baseoid . ".4.1.4.1.2.1.21";              # pdPresentCount
     $phydrv_goodcount_oid = $baseoid . ".4.1.4.1.2.1.22";          # pdDiskPresentCount
     $phydrv_badcount_oid = $baseoid . ".4.1.4.1.2.1.23";           # pdDiskPredFailureCount
@@ -1022,6 +1033,7 @@ sub create_snmp_session {
      ($session, $error) = Net::SNMP->session(
       -hostname         => $o_host,
       -version          => '3',
+      -maxmsgsize		=> 16384,
       -port             => $o_port,
       -username         => $o_login,
       -authpassword     => $o_passwd,
@@ -1033,6 +1045,7 @@ sub create_snmp_session {
      ($session, $error) = Net::SNMP->session(
       -hostname         => $o_host,
       -version          => '3',
+      -maxmsgsize		=> 16384,
       -username         => $o_login,
       -port             => $o_port,
       -authpassword     => $o_passwd,
@@ -1047,20 +1060,22 @@ sub create_snmp_session {
     # SNMPv2c Login
       verb("SNMP v2c login");
       ($session, $error) = Net::SNMP->session(
-       -hostname  => $o_host,
-       -version   => 2,
-       -community => $o_community,
-       -port      => $o_port,
-       -timeout   => $timeout
+       -hostname  	=> $o_host,
+       -version   	=> 2,
+       -maxmsgsize	=> 16384,
+       -community	=> $o_community,
+       -port      	=> $o_port,
+       -timeout   	=> $timeout
       );
   } else {
     # SNMPV1 login
       verb("SNMP v1 login");
       ($session, $error) = Net::SNMP->session(
-       -hostname  => $o_host,
-       -community => $o_community,
-       -port      => $o_port,
-       -timeout   => $timeout
+       -hostname  	=> $o_host,
+       -community 	=> $o_community,
+       -maxmsgsize	=> 16384,
+       -port      	=> $o_port,
+       -timeout   	=> $timeout
       );
   }
   if (!defined($session)) {
@@ -1086,6 +1101,7 @@ my $snmp_result = undef;
 my ($logdrv_data_in, $logdrv_task_status_in, $logdrv_task_completion_in) = (undef,undef,undef);
 my ($phydrv_data_in, $phydrv_merr_in, $phydrv_oerr_in) = (undef,undef,undef);
 my ($phydrv_vendor_in, $phydrv_product_in, $battery_data_in) = (undef,undef,undef);
+my ($phydrv_controller_in,$phydrv_channel_in,$phydrv_devid_in,$phydrv_lunid_in) = (undef,undef,undef,undef,undef);
 
 $session = create_snmp_session();
 
@@ -1098,7 +1114,11 @@ if ($cardtype eq 'megaraid' && defined($opt_drverrors)) {
 }
 if ($cardtype eq 'sasraid') {
         $debug_time{snmpretrieve_readwritefailoids}=time() if $opt_debugtime;
-        $snmp_result=$session->get_request(-Varbindlist => [ $phydrv_count_oid, $phydrv_goodcount_oid, $phydrv_badcount_oid, $phydrv_bad2count_oid ]);
+        $snmp_result = $session->get_table(-baseoid => $adapter_status_tableoid);
+        $phydrv_controller_in = $session->get_table(-baseoid => $phydrv_controller_tableoid);
+        $phydrv_channel_in = $session->get_table(-baseoid => $phydrv_channel_tableoid);
+        $phydrv_devid_in = $session->get_table(-baseoid => $phydrv_devid_tableoid);
+        $phydrv_lunid_in = $session->get_table(-baseoid => $phydrv_lunid_tableoid);
         $debug_time{snmpretrieve_readwritefailoids}=time()-$debug_time{snmpretrieve_readwritefailoids} if $opt_debugtime;
         $error.="could not retrieve snmp data OIDs" if !$snmp_result;
 }
@@ -1224,10 +1244,14 @@ if (defined($opt_drverrors) && $cardtype eq 'megaraid') {
     }
 }
 if ($cardtype eq 'sasraid') {
-    if (exists($snmp_result->{$phydrv_count_oid}) && $snmp_result->{$phydrv_count_oid}>0) {
-        my $total = $snmp_result->{$phydrv_count_oid};
-        my $good = $snmp_result->{$phydrv_goodcount_oid}||0;
-        my $bad = ($snmp_result->{$phydrv_badcount_oid}||0)+($snmp_result->{$phydrv_bad2count_oid}||0);
+    my ($total,$good,$bad) = 0;
+    if ( $snmp_result ) {
+        foreach my $l_key (Net::SNMP::oid_lex_sort(keys(%{$snmp_result}))) {
+        	$total += $snmp_result->{$l_key} if Net::SNMP::oid_base_match($phydrv_count_oid,$l_key);
+        	$good += $snmp_result->{$l_key} if Net::SNMP::oid_base_match($phydrv_goodcount_oid,$l_key);
+        	$bad += $snmp_result->{$l_key} if Net::SNMP::oid_base_match($phydrv_badcount_oid,$l_key);
+        	$bad += $snmp_result->{$l_key} if Net::SNMP::oid_base_match($phydrv_bad2count_oid,$l_key);
+        }
         verb("Good $good $bad $bad Total $total \n");
         if (defined($opt_gooddrives) and $opt_gooddrives>0) {
             $output_data.= ", " if $output_data;
@@ -1257,7 +1281,15 @@ foreach $line (Net::SNMP::oid_lex_sort(keys(%{$phydrv_data_in}))) {
         $code = $phydrv_data_in->{$line};
         verb("phydrv_status: $line = $code");
         $line = substr($line,length($phydrv_status_tableoid)+1);
-        ($controller_id,$channel_id,$drive_id,$lun_id) = split(/\./,$line,4);
+        if ( $cardtype eq 'sasraid' ) {
+        	$controller_id = $phydrv_controller_in->{$phydrv_controller_tableoid.'.'.$line};
+        	$channel_id = $phydrv_channel_in->{$phydrv_channel_tableoid.'.'.$line};
+        	$drive_id = $phydrv_devid_in->{$phydrv_devid_tableoid.'.'.$line};
+        	$lun_id = $phydrv_lunid_in->{$phydrv_lunid_tableoid.'.'.$line};
+        } else{
+        	($controller_id,$channel_id,$drive_id,$lun_id) = split(/\./,$line,4);	
+        }
+        
         if (!$drive_id) {
                 if (!$channel_id) {
                         $drive_id = $controller_id;
